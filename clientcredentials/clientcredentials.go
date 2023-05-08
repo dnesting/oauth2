@@ -57,7 +57,8 @@ func (c *Config) Token(ctx context.Context) (*oauth2.Token, error) {
 }
 
 // Client returns an HTTP client using the provided token.
-// The token will auto-refresh as necessary.
+// The token will auto-refresh as necessary, using the request
+// context that triggered it.
 //
 // The provided context optionally controls which HTTP client
 // is returned. See the oauth2.HTTPClient variable.
@@ -67,9 +68,15 @@ func (c *Config) Client(ctx context.Context) *http.Client {
 	return oauth2.NewClient(ctx, c.TokenSource(ctx))
 }
 
-// TokenSource returns a TokenSource that returns t until t expires,
-// automatically refreshing it as necessary using the provided context and the
-// client ID and client secret.
+// TokenSource returns a oauth2.TokenSource that returns t until t expires,
+// automatically refreshing it as necessary using the provided context.
+// The returned TokenSource implements oauth2.ContextTokenSource.
+//
+// If an HTTP client is provided in ctx (see the oauth2.HTTPClient variable),
+// it will be used to request the token.  For backward compatibility,
+// ctx will also be used as the request context for Token() calls.
+// Call TokenContext(context.Background()) if you want to explicitly
+// refresh tokens using the background context for the request.
 //
 // Most users will use Config.Client instead.
 func (c *Config) TokenSource(ctx context.Context) oauth2.TokenSource {
@@ -88,6 +95,14 @@ type tokenSource struct {
 // Token refreshes the token by using a new client credentials request.
 // tokens received this way do not include a refresh token
 func (c *tokenSource) Token() (*oauth2.Token, error) {
+	// Use c.ctx to retain backwards compatibility. This has the effect of sending
+	// the stored context as the request context for the token refresh.
+	return c.TokenContext(c.ctx)
+}
+
+// TokenContext refreshes the token by using a new client credentials request.
+// tokens received this way do not include a refresh token
+func (c *tokenSource) TokenContext(ctx context.Context) (*oauth2.Token, error) {
 	v := url.Values{
 		"grant_type": {"client_credentials"},
 	}
@@ -103,7 +118,7 @@ func (c *tokenSource) Token() (*oauth2.Token, error) {
 		v[k] = p
 	}
 
-	tk, err := internal.RetrieveToken(c.ctx, c.conf.ClientID, c.conf.ClientSecret, c.conf.TokenURL, v, internal.AuthStyle(c.conf.AuthStyle))
+	tk, err := internal.RetrieveToken(ctx, c.ctx, c.conf.ClientID, c.conf.ClientSecret, c.conf.TokenURL, v, internal.AuthStyle(c.conf.AuthStyle))
 	if err != nil {
 		if rErr, ok := err.(*internal.RetrieveError); ok {
 			return nil, (*oauth2.RetrieveError)(rErr)
@@ -118,3 +133,6 @@ func (c *tokenSource) Token() (*oauth2.Token, error) {
 	}
 	return t.WithExtra(tk.Raw), nil
 }
+
+// Verify all types implementing TokenSource also implement ContextTokenSource.
+var _ oauth2.ContextTokenSource = (*tokenSource)(nil)

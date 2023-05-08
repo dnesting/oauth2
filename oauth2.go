@@ -60,10 +60,46 @@ type Config struct {
 	Scopes []string
 }
 
+// A ContextTokenSource is anything that can return a token.  All
+// TokenSource implementations in this package implement ContextTokenSource.
+// This allows propagation of a context, such as a caller's request context,
+// to the token refresh request.  It is used by the HTTP clients returned
+// by NewClient and config.Client to propagate the request context to
+// token refreshes.  It should generally be used like this:
+//
+//	// All TokenSource implementations in this package implement
+//	// ContextTokenSource.
+//	ts := config.TokenSource(ctx, token).(oauth2.ContextTokenSource)
+//	ts.TokenContext(ctx)
+//
+//	// Otherwise, check for the interface:
+//	if cts, ok := ts.(oauth2.ContextTokenSource); ok {
+//	    token, err := cts.TokenContext(ctx)
+//	} else {
+//	    token, err := cts.Token()
+//	}
+//
+// If an HTTP client is provided in the context, it will be ignored.
+type ContextTokenSource interface {
+	TokenSource
+
+	// Token returns a token or an error.
+	// Token must be safe for concurrent use by multiple goroutines.
+	// The returned Token must not be modified.
+	// If a context is not available, use Token() rather than
+	// introduce a new context such as context.Background()
+	// since implementations may have different behavior.
+	TokenContext(context.Context) (*Token, error)
+}
+
 // A TokenSource is anything that can return a token.
+// New implementations should consider also implementing
+// ContextTokenSource.
 type TokenSource interface {
 	// Token returns a token or an error.
 	// Token must be safe for concurrent use by multiple goroutines.
+	// If you have a context you want to propagate, check for
+	// ContextTokenSource and call TokenContext instead.
 	// The returned Token must not be modified.
 	Token() (*Token, error)
 }
@@ -196,7 +232,7 @@ func (c *Config) PasswordCredentialsToken(ctx context.Context, username, passwor
 	if len(c.Scopes) > 0 {
 		v.Set("scope", strings.Join(c.Scopes, " "))
 	}
-	return retrieveToken(ctx, c, v)
+	return retrieveToken(ctx, ctx, c, v)
 }
 
 // Exchange converts an authorization code into a token.
@@ -222,12 +258,13 @@ func (c *Config) Exchange(ctx context.Context, code string, opts ...AuthCodeOpti
 	for _, opt := range opts {
 		opt.setValue(v)
 	}
-	return retrieveToken(ctx, c, v)
+	return retrieveToken(ctx, ctx, c, v)
 }
 
 // Client returns an HTTP client using the provided token.
-// The token will auto-refresh as necessary. The underlying
-// HTTP transport will be obtained using the provided context.
+// The token will auto-refresh as necessary, using the request
+// context that triggered it.
+// The underlying HTTP transport will be obtained using the provided context.
 // The returned client and its Transport should not be modified.
 func (c *Config) Client(ctx context.Context, t *Token) *http.Client {
 	return NewClient(ctx, c.TokenSource(ctx, t))
@@ -235,6 +272,13 @@ func (c *Config) Client(ctx context.Context, t *Token) *http.Client {
 
 // TokenSource returns a TokenSource that returns t until t expires,
 // automatically refreshing it as necessary using the provided context.
+// The returned TokenSource implements ContextTokenSource.
+//
+// If an HTTP client is provided in ctx (see the HTTPClient variable),
+// it will be used to refresh the token.  For backward compatibility,
+// ctx will be used as the request context for Token() calls.
+// Call TokenContext(context.Background()) if you want to explicitly
+// refresh tokens using the background context for the request.
 //
 // Most users will use Config.Client instead.
 func (c *Config) TokenSource(ctx context.Context, t *Token) TokenSource {
@@ -264,11 +308,17 @@ type tokenRefresher struct {
 // Within this package, it is used by reuseTokenSource which
 // synchronizes calls to this method with its own mutex.
 func (tf *tokenRefresher) Token() (*Token, error) {
+	// Use tf.ctx to retain backwards compatibility. This has the effect of sending
+	// the stored context as the request context for the token refresh.
+	return tf.TokenContext(tf.ctx)
+}
+
+func (tf *tokenRefresher) TokenContext(ctx context.Context) (*Token, error) {
 	if tf.refreshToken == "" {
 		return nil, errors.New("oauth2: token expired and refresh token is not set")
 	}
 
-	tk, err := retrieveToken(tf.ctx, tf.conf, url.Values{
+	tk, err := retrieveToken(ctx, tf.ctx, tf.conf, url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {tf.refreshToken},
 	})
@@ -296,15 +346,36 @@ type reuseTokenSource struct {
 }
 
 // Token returns the current token if it's still valid, else will
-// refresh the current token (using r.Context for HTTP client
-// information) and return the new one.
+// refresh the current token and return the new one.
 func (s *reuseTokenSource) Token() (*Token, error) {
+	// Per ContextTokenSource.TokenContext, we should prefer to call Token()
+	// in wrapped TokenSource implementations even if they implement
+	// ContextTokenSource, since we do not have a context to pass here.
+	//lint:ignore SA1012 nil is an internal signal for lack of context
+	return s.tokenContext(nil)
+}
+
+// TokenContext returns the current token if it's still valid, else will
+// refresh the current token using ctx and return the new one.
+func (s *reuseTokenSource) TokenContext(ctx context.Context) (*Token, error) {
+	if ctx == nil {
+		panic("context cannot be nil")
+	}
+	return s.tokenContext(ctx)
+}
+
+func (s *reuseTokenSource) tokenContext(ctx context.Context) (t *Token, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.t.Valid() {
 		return s.t, nil
 	}
-	t, err := s.new.Token()
+	// Only call TokenContext if we were called as TokenContext.
+	if cs, ok := s.new.(ContextTokenSource); ok && ctx != nil {
+		t, err = cs.TokenContext(ctx)
+	} else {
+		t, err = s.new.Token()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +386,8 @@ func (s *reuseTokenSource) Token() (*Token, error) {
 
 // StaticTokenSource returns a TokenSource that always returns the same token.
 // Because the provided token t is never refreshed, StaticTokenSource is only
-// useful for tokens that never expire.
+// useful for tokens that never expire.  The returned TokenSource
+// implements ContextTokenSource. TokenContext behaves identically to Token.
 func StaticTokenSource(t *Token) TokenSource {
 	return staticTokenSource{t}
 }
@@ -329,16 +401,20 @@ func (s staticTokenSource) Token() (*Token, error) {
 	return s.t, nil
 }
 
+func (s staticTokenSource) TokenContext(context.Context) (*Token, error) {
+	return s.t, nil
+}
+
 // HTTPClient is the context key to use with golang.org/x/net/context's
 // WithValue function to associate an *http.Client value with a context.
 var HTTPClient internal.ContextKey
 
 // NewClient creates an *http.Client from a Context and TokenSource.
-// The returned client is not valid beyond the lifetime of the context.
 //
-// Note that if a custom *http.Client is provided via the Context it
-// is used only for token acquisition and is not used to configure the
-// *http.Client returned from NewClient.
+// If an *http.Client is provided via the context (see the HTTPClient
+// variable), its Transport will be used in the returned client.
+// If src implements ContextTokenSource, TokenContext will be called
+// with the client's request context.
 //
 // As a special case, if src is nil, a non-OAuth2 client is returned
 // using the provided context. This exists to support related OAuth2
@@ -367,6 +443,7 @@ func NewClient(ctx context.Context, src TokenSource) *http.Client {
 // wrapped in a caching version if it isn't one already. This also
 // means it's always safe to wrap ReuseTokenSource around any other
 // TokenSource without adverse effects.
+// The returned TokenSource implements ContextTokenSource.
 func ReuseTokenSource(t *Token, src TokenSource) TokenSource {
 	// Don't wrap a reuseTokenSource in itself. That would work,
 	// but cause an unnecessary number of mutex operations.
@@ -410,3 +487,8 @@ func ReuseTokenSourceWithExpiry(t *Token, src TokenSource, earlyExpiry time.Dura
 		expiryDelta: earlyExpiry,
 	}
 }
+
+// Verify all types implementing TokenSource also implement ContextTokenSource.
+var _ ContextTokenSource = (*staticTokenSource)(nil)
+var _ ContextTokenSource = (*reuseTokenSource)(nil)
+var _ ContextTokenSource = (*tokenRefresher)(nil)

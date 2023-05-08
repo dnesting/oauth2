@@ -1,6 +1,7 @@
 package oauth2
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -14,6 +15,18 @@ type tokenSource struct{ token *Token }
 func (t *tokenSource) Token() (*Token, error) {
 	return t.token, nil
 }
+
+type ctxTokenSource struct {
+	tokenSource
+	lastProvidedCtx context.Context
+}
+
+func (t *ctxTokenSource) TokenContext(ctx context.Context) (*Token, error) {
+	t.lastProvidedCtx = ctx
+	return t.token, nil
+}
+
+var _ ContextTokenSource = (*ctxTokenSource)(nil)
 
 func TestTransportNilTokenSource(t *testing.T) {
 	tr := &Transport{}
@@ -106,6 +119,41 @@ func TestTransportTokenSource(t *testing.T) {
 	res, err := client.Get(server.URL)
 	if err != nil {
 		t.Fatal(err)
+	}
+	res.Body.Close()
+}
+
+// Test that the token source is called with the request context
+// if it implements ContextTokenSource.
+func TestTransportContextTokenSource(t *testing.T) {
+	ts := &ctxTokenSource{
+		tokenSource: tokenSource{
+			token: &Token{
+				AccessToken: "abc",
+			},
+		},
+	}
+	tr := &Transport{
+		Source: ts,
+	}
+	server := newMockServer(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("Authorization"), "Bearer abc"; got != want {
+			t.Errorf("Authorization header = %q; want %q", got, want)
+		}
+	})
+	defer server.Close()
+	client := &http.Client{Transport: tr}
+	var ctxKey = struct{}{}
+	ctx := context.WithValue(context.Background(), ctxKey, "ok")
+	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL, nil)
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ts.lastProvidedCtx == nil {
+		t.Error("no request context was provided to the token source")
+	} else if ts.lastProvidedCtx.Value(ctxKey) != "ok" {
+		t.Errorf("wrong context provided to request, got %v; want %v", ts.lastProvidedCtx, ctx)
 	}
 	res.Body.Close()
 }

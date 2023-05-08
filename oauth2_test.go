@@ -598,3 +598,73 @@ func TestConfigClientWithToken(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestTokenSourceContext(t *testing.T) {
+	internal.ResetAuthCache()
+	var actualClient, actualRequestCtx string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Record the name of the HTTP client and the name associated with
+		// the request context.
+		actualClient = r.Header.Get("X-Test-Client")
+		if actualClient == "" {
+			actualClient = "empty"
+		}
+		actualRequestCtx = r.Header.Get("X-Test-Context")
+		if actualRequestCtx == "" {
+			actualRequestCtx = "empty"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token":"ACCESS_TOKEN",  "scope": "user", "token_type": "bearer", "refresh_token": "NEW_REFRESH_TOKEN"}`))
+	}))
+	defer ts.Close()
+	conf := newConf(ts.URL)
+
+	var contextKey = struct{}{}
+	newCtx := func(name string) context.Context {
+		// Set up a context with an HTTP client that records its name in the
+		// HTTP header X-Test-Client, and records the name associated with
+		// the request context in X-Test-Context.
+		client := &http.Client{
+			Transport: &mockTransport{
+				rt: func(r *http.Request) (w *http.Response, err error) {
+					r = r.Clone(r.Context())
+					r.Header.Set("X-Test-Client", name)
+					ctxUsed, ok := r.Context().Value(contextKey).(string)
+					if ok {
+						r.Header.Set("X-Test-Context", ctxUsed)
+					}
+					t.Log(r.Method, r.URL.String(), name, ctxUsed)
+					return http.DefaultTransport.RoundTrip(r)
+				},
+			},
+		}
+		ctx := context.WithValue(context.Background(), HTTPClient, client)
+		ctx = context.WithValue(ctx, contextKey, name)
+		return ctx
+	}
+
+	for _, tc := range []struct {
+		name           string
+		wantClient     string
+		wantRequestCtx string
+	}{
+		{"Token", "tokenSource", "tokenSource"},
+		{"TokenContext", "tokenSource", "token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			actualClient, actualRequestCtx = "unset", "unset"
+			source := conf.TokenSource(newCtx("tokenSource"), &Token{RefreshToken: "REFRESH_TOKEN"})
+			if tc.name == "TokenContext" {
+				source.(ContextTokenSource).TokenContext(newCtx("token"))
+			} else {
+				source.Token()
+			}
+			if actualClient != tc.wantClient {
+				t.Errorf("token refresh used %s client, expected %s", actualClient, tc.wantClient)
+			}
+			if actualRequestCtx != tc.wantRequestCtx {
+				t.Errorf("token refresh used %s request context, expected %x", actualRequestCtx, tc.wantRequestCtx)
+			}
+		})
+	}
+}

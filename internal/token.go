@@ -189,7 +189,7 @@ func cloneURLValues(v url.Values) url.Values {
 	return v2
 }
 
-func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string, v url.Values, authStyle AuthStyle) (*Token, error) {
+func RetrieveToken(ctx context.Context, clientCtx context.Context, clientID, clientSecret, tokenURL string, v url.Values, authStyle AuthStyle) (*Token, error) {
 	needsAuthStyleProbe := authStyle == 0
 	if needsAuthStyleProbe {
 		if style, ok := lookupAuthStyle(tokenURL); ok {
@@ -203,7 +203,7 @@ func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string,
 	if err != nil {
 		return nil, err
 	}
-	token, err := doTokenRoundTrip(ctx, req)
+	token, err := doTokenRoundTrip(ctx, clientCtx, req)
 	if err != nil && needsAuthStyleProbe {
 		// If we get an error, assume the server wants the
 		// clientID & clientSecret in a different form.
@@ -219,7 +219,7 @@ func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string,
 		// So just try both ways.
 		authStyle = AuthStyleInParams // the second way we'll try
 		req, _ = newTokenRequest(tokenURL, clientID, clientSecret, v, authStyle)
-		token, err = doTokenRoundTrip(ctx, req)
+		token, err = doTokenRoundTrip(ctx, clientCtx, req)
 	}
 	if needsAuthStyleProbe && err == nil {
 		setAuthStyle(tokenURL, authStyle)
@@ -232,8 +232,8 @@ func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string,
 	return token, err
 }
 
-func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
-	r, err := ContextClient(ctx).Do(req.WithContext(ctx))
+func doTokenRoundTrip(ctx context.Context, clientCtx context.Context, req *http.Request) (*Token, error) {
+	r, err := ContextClient(clientCtx).Do(req.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
